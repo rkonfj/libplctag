@@ -654,6 +654,15 @@ int parse_bit_segment(omron_tag_p tag, const char *name, int *name_index) {
     return PLCTAG_STATUS_OK;
 }
 
+/* tag name 分隔符判断（段结束/数组/字符串结束） */
+static inline int is_seg_delim(unsigned char c) {
+    return (c == 0) || (c == '.') || (c == '[') || (c == ']');
+}
+
+/* UTF-8 字节（高位为 1） */
+static inline int is_utf8_byte(unsigned char c) {
+    return (c & 0x80) != 0;
+}
 
 int parse_symbolic_segment(omron_tag_p tag, const char *name, int *encoded_index, int *name_index) {
     int encoded_i = *encoded_index;
@@ -664,30 +673,52 @@ int parse_symbolic_segment(omron_tag_p tag, const char *name, int *encoded_index
 
     pdebug(DEBUG_MODULE_OMRON_CIP, DEBUG_DETAIL, "Starting with name index=%d and encoded name index=%d.", name_i, encoded_i);
 
-    /* a symbolic segment must start with an alphabetic character or @, then can have digits or underscores. */
-    if(!isalpha(name[name_i]) && name[name_i] != ':' && name[name_i] != '_' && name[name_i] != '@') {
+    /* 支持 UTF-8 段名。注意 ctype 参数必须是 unsigned char，否则高位字节会 UB */
+    unsigned char c0 = (unsigned char)name[name_i];
+
+    /* 分隔符处不可能是段开头 */
+    if (is_seg_delim(c0)) {
         pdebug(DEBUG_MODULE_OMRON_CIP, DEBUG_DETAIL, "tag name at position %d is not the start of a symbolic segment.", name_i);
         return PLCTAG_ERR_NO_MATCH;
+    }
+
+    /* ASCII 继续按原规则；UTF-8（>=0x80）直接放行 */
+    if (!is_utf8_byte(c0)) {
+        if (!isalpha(c0) && c0 != ':' && c0 != '_' && c0 != '@') {
+            pdebug(DEBUG_MODULE_OMRON_CIP, DEBUG_DETAIL, "tag name at position %d is not the start of a symbolic segment.", name_i);
+            return PLCTAG_ERR_NO_MATCH;
+        }
     }
 
     /* start building the encoded symbolic segment. */
     tag->encoded_name[encoded_i] = 0x91; /* start of symbolic segment. */
     encoded_i++;
     seg_len_index = encoded_i;
-    tag->encoded_name[seg_len_index]++;
+    tag->encoded_name[seg_len_index] = 0;
     encoded_i++;
 
-    /* store the first character of the name. */
-    tag->encoded_name[encoded_i] = (uint8_t)name[name_i];
-    encoded_i++;
-    name_i++;
+    while (!is_seg_delim((unsigned char)name[name_i]) && (encoded_i < (MAX_TAG_NAME - 1))) {
+        unsigned char ch = (unsigned char)name[name_i];
 
-    /* get the rest of the name. */
-    while((isalnum(name[name_i]) || name[name_i] == ':' || name[name_i] == '_') && (encoded_i < (MAX_TAG_NAME - 1))) {
-        tag->encoded_name[encoded_i] = (uint8_t)name[name_i];
-        encoded_i++;
+        /*
+         * ASCII 字符仍按原限制（字母数字 : _）；
+         * UTF-8（>=0x80）直接允许（包括续字节 0x80-0xBF）
+         */
+        if (!is_utf8_byte(ch)) {
+            if (!(isalnum(ch) || ch == ':' || ch == '_')) {
+                break;
+            }
+        }
+
+        tag->encoded_name[encoded_i++] = (uint8_t)ch;
         tag->encoded_name[seg_len_index]++;
         name_i++;
+
+        /* 0x91 的 length 是 1 字节，防止溢出 */
+        if (tag->encoded_name[seg_len_index] == 255) {
+            pdebug(DEBUG_MODULE_OMRON_CIP, DEBUG_WARN, "Symbolic segment too long (>=255 bytes) in tag name %s!", name);
+            return PLCTAG_ERR_BAD_PARAM;
+        }
     }
 
     seg_len = tag->encoded_name[seg_len_index];
